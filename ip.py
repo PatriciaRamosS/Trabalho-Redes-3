@@ -1,250 +1,192 @@
 # GRUPO
 # Patrícia da Silva Ramos
 # Marcelina Maye Abaga Maye
-
-import asyncio
-from tcputils import *
-from os import urandom
-from math import ceil
-from collections import deque
-import time
+from grader.iputils import *
+import struct
 
 
-class Servidor:
+class IP:
 
-    def __init__(self, rede, porta):
-        self.rede = rede
-        self.porta = porta
-        self.conexoes = {}
+    def __init__(self, enlace):
+        """
+        Inicia a camada de rede. Recebe como argumento uma implementação
+        de camada de enlace capaz de localizar os next_hop (por exemplo,
+        Ethernet com ARP).
+        """
         self.callback = None
-        self.rede.registrar_recebedor(self._rdt_rcv)
+        self.enlace = enlace
+        self.enlace.registrar_recebedor(self.__raw_recv)
+        self.ignore_checksum = self.enlace.ignore_checksum
+        self.meu_endereco = None
+        self.contador = 0
 
-    def registrar_monitor_de_conexoes_aceitas(self, callback):
-        """
-        Usado pela camada de aplicação para registrar uma função para ser chamada
-        sempre que uma nova conexão for aceita
-        """
-        self.callback = callback
-
-    def _rdt_rcv(self, src_addr, dst_addr, segment):
-        src_port, dst_port, seq_no, ack_no, \
-            flags, window_size, checksum, urg_ptr = read_header(segment)
-
-        if dst_port != self.porta:
-            # Ignora segmentos que não são destinados à porta do nosso servidor
+    def __raw_recv(self, datagrama):
+        dscp, ecn, identification, flags, frag_offset, ttl, proto, \
+           src_addr, dst_addr, payload = read_ipv4_header(datagrama)
+        ttl_ = ttl - 1
+        if ttl_ == 0:
+            datagramaICMP = self.criarICMP(datagrama)
+            self.enviar(datagramaICMP, src_addr, 0x01)
             return
-        if not self.rede.ignore_checksum and calc_checksum(
-                segment, src_addr, dst_addr) != 0:
-            print('descartando segmento com checksum incorreto')
-            return
+        datagrama = self.trocar_ttl(datagrama, ttl_)
 
-        payload = segment[4 * (flags >> 12):]
-        id_conexao = (src_addr, src_port, dst_addr, dst_port)
-
-        if (flags & FLAGS_SYN) == FLAGS_SYN:
-            # A flag SYN estar setada significa que é um cliente tentando estabelecer uma conexão nova
-            # TODO: talvez você precise passar mais coisas para o construtor de conexão
-            conexao = self.conexoes[id_conexao] = Conexao(
-                self, id_conexao, seq_no, ack_no, dst_port, src_port, dst_addr,
-                src_addr)
-            # TODO: você precisa fazer o handshake aceitando a conexão. Escolha se você acha melhor
-            # fazer aqui mesmo ou dentro da classe Conexao.
-            if self.callback:
-                self.callback(conexao)
-        elif id_conexao in self.conexoes:
-            # Passa para a conexão adequada se ela já estiver estabelecida
-            self.conexoes[id_conexao]._rdt_rcv(seq_no, ack_no, flags, payload)
+        if dst_addr == self.meu_endereco:
+            # atua como host
+            if proto == IPPROTO_TCP and self.callback:
+                self.callback(src_addr, dst_addr, payload)
         else:
-            print('%s:%d -> %s:%d (pacote associado a conexão desconhecida)' %
-                  (src_addr, src_port, dst_addr, dst_port))
+            # atua como roteador
+            next_hop = self._next_hop(dst_addr)
+            # TODO: Trate corretamente o campo TTL do datagrama
+            self.enlace.enviar(datagrama, next_hop)
 
+    #Criar Protocolo de Mensagens de Controle da Internet
+    def criarICMP(self, datagrama):
 
-class Conexao:
+        byte0and1 = struct.pack("!BB", 0xb, 0x0)
 
-    def __init__(self, servidor, id_conexao, seq_no, ack_no, dst_port,
-                 src_port, dst_addr, src_addr):
-        self.servidor = servidor
-        self.id_conexao = id_conexao
-        self.callback = None
-        # self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)  # um timer pode ser criado assim; esta linha é só um exemplo e pode ser removida
-        #self.timer.cancel()   # é possível cancelar o timer chamando esse método; esta linha é só um exemplo e pode ser removida
-        self.timer = None
-        self.seq_esperado = seq_no + 1  #expected_seq_no
-        self.tam_segmento = ack_no  #my_len_seq_no
-        self.fila_seg_enviado = deque()  #sef_sended_queue
-        self.tam_seg_enviado = 0  #seg_sended_length
-        self.fila_seg_esperando = deque()  #seg_waiting_queue
-        self.tam_janela = 1 * MSS  # win_size
-        self.checado = False  #alreadyChecked
-        self.SampleRTT = 1
-        self.EstimatedRTT = self.SampleRTT
-        self.DevRTT = self.SampleRTT / 2
-        self.TimeoutInterval = 1
-        # Variaveis para enviar para a conexao
-        self.ack_envia = seq_no + 1  #ack_enviar
-        self.seq_envia = int(urandom(2).hex(), 16)  # seq_enviar
-        #Montando cabeçalho para enviar para o cliente
-        segmento = make_header(dst_port, src_port, self.seq_envia,
-                               self.ack_envia, FLAGS_SYN | FLAGS_ACK)
-        #Enviando resposta
-        resposta = fix_checksum(segmento, dst_addr, src_addr)
-        self.servidor.rede.enviar(resposta, src_addr)
+        byte2and3 = struct.pack("!H", 0)
 
-    #def _exemplo_timer(self):
-    # Esta função é só um exemplo e pode ser removida
-    #   print('Este é um exemplo de como fazer um timer')
-    def _timeout(self):
-        self.timer = None
-        self.tam_janela /= 2
+        byte4to7 = struct.pack("!I", 0)
+        rest = datagrama[:28]
+        byte8to11 = rest
+        payloadICMP = byte0and1 + byte2and3 + byte4to7 + byte8to11
+        checksum = calc_checksum(payloadICMP)
+        byte2and3 = struct.pack("!H", checksum)
+        payloadICMP = byte0and1 + byte2and3 + byte4to7 + byte8to11
+        return payloadICMP
 
-        if len(self.fila_seg_enviado):
-            _, segmento, addr, tam_dados = self.fila_seg_enviado.popleft()
-            self.fila_seg_enviado.appendleft((0, segmento, addr, tam_dados))
-            self.servidor.rede.enviar(segmento, addr)
-            self.timer = asyncio.get_event_loop().call_later(
-                self.TimeoutInterval, self._timeout)
+    def trocar_ttl(self, datagrama, novo_ttl):
+        dscp, ecn, identification, flags, frag_offset, ttl, proto, \
+           src_addr, dst_addr, payload = read_ipv4_header(datagrama)
 
-    def _rdt_rcv(self, seq_no, ack_no, flags, payload):
-        # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
-        # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
-        # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
+        byte0 = struct.pack("!B", 0x45)
 
-        if (flags & FLAGS_FIN == FLAGS_FIN):
-            self.callback(self, b'')
-            self.tam_segmento = ack_no
-            src_addr, src_port, dst_addr, dst_port = self.id_conexao
-            segment = make_header(dst_port, src_port, self.seq_envia,
-                                  self.seq_esperado + 1, flags)
-            resposta = fix_checksum(segment, dst_addr, src_addr)
-            self.servidor.rede.enviar(resposta, src_addr)
-        elif (seq_no == self.seq_esperado):
-            # Step 2: verificar número de sequência esperado
-            if payload:
-                self.seq_esperado += len(payload)
-                self.callback(self, payload)
-            else:
-                self.seq_esperado += 0
-            #self.seq_esperado += (len(payload) if payload else 0)
+        byte1 = struct.pack("!B", dscp & ecn)
 
-        # payload = '\r\n'
-        # self.callback(self, payload)
-            self.tam_segmento = ack_no
-            if (flags & FLAGS_ACK == FLAGS_ACK):
-                if (len(payload) > 0):
-                    src_addr, src_port, dst_addr, dst_port = self.id_conexao
-                    segment = make_header(dst_port, src_port, self.seq_envia,
-                                          self.seq_esperado, flags)
-                    resposta = fix_checksum(segment, dst_addr, src_addr)
-                    self.servidor.rede.enviar(resposta, src_addr)
+        tamTotal = len(payload)
+        byte2and3 = struct.pack("!H", tamTotal)
 
-                a = self.tam_seg_enviado > 0
+        byte4and5 = struct.pack("!H", identification)
 
-                if (self.timer != None):
-                    self.timer.cancel()
-                    self.timer = None
+        byte6and7 = struct.pack("!H", flags & frag_offset)
 
-                    # TODO: checar com o ack_no quais sementos foram confirmados, pois mais de um pode ser confirmado de uma vez só
+        byte8 = struct.pack("!B", novo_ttl)
 
-                    # a confirmação que um segmento foi recebido pode ser pulada caso o proximo segmento já tenha sido recebido também, nesse caso, só o último segmento é confirmado como recebido
+        byte9 = struct.pack("!B", proto)
 
-                    # atualmente estamos considerando que cada confirmação é para um segmento, o que não é o certo
+        byte10and11 = struct.pack("!H", 0x0000)
 
-                    while len(self.fila_seg_enviado):
-                        firstTime, segmento, _, len_dados = self.fila_seg_enviado.popleft(
-                        )
-                        self.tam_seg_enviado -= len_dados
-                        _, _, seq, _, _, _, _, _ = read_header(segmento)
+        sourceIpAddr, = struct.unpack('!I', str2addr(src_addr))
+        byte12to15 = struct.pack("!I", sourceIpAddr)
 
-                        if seq == ack_no:
-                            break
+        destIpAddr, = struct.unpack('!I', str2addr(dst_addr))
+        byte16to19 = struct.pack("!I", destIpAddr)
 
-                    if firstTime != 0:
-                        self.SampleRTT = time.time() - firstTime
-                        if self.checado == False:
-                            self.checado = True
-                            self.EstimatedRTT = self.SampleRTT
-                            self.DevRTT = self.SampleRTT / 2
-                        else:
-                            self.EstimatedRTT = (
-                                1 - 0.125
-                            ) * self.EstimatedRTT + 0.125 * self.SampleRTT
-                            self.DevRTT = (1 - 0.25) * self.DevRTT + 0.25 * \
-                                abs(self.SampleRTT - self.EstimatedRTT)
-                        self.TimeoutInterval = self.EstimatedRTT + 4 * self.DevRTT
+        #Montando o datagrama e verificando o checksum do datagrama
+        datagrama = byte0 + byte1 + byte2and3 + byte4and5 + byte6and7 + byte8 + byte9 + byte10and11 + byte12to15 + byte16to19
+        headerChecksum = calc_checksum(datagrama)
+        byte10and11 = struct.pack("!H", headerChecksum)
+        datagrama = byte0 + byte1 + byte2and3 + byte4and5 + byte6and7 + byte8 + byte9 + byte10and11 + byte12to15 + byte16to19
 
-                b = self.tam_seg_enviado == 0
-                if a == True and b == True:
-                    self.tam_janela += MSS
-                while len(self.fila_seg_esperando):
-                    resposta, src_addr, len_dados = self.fila_seg_esperando.popleft(
-                    )
+        #Retornando datagrama
+        return datagrama
 
-                    if self.tam_seg_enviado + len_dados > self.tam_janela:
-                        self.fila_seg_esperando.appendleft(
-                            (resposta, src_addr, len_dados))
-                        break
+    def _next_hop(self, dest_addr):
+        # TODO: Use a tabela de encaminhamento para determinar o próximo salto
+        # (next_hop) a partir do endereço de destino do datagrama (dest_addr).
+        # Retorne o next_hop para o dest_addr fornecido.
 
-                    self.tam_seg_enviado += len_dados
-                    self.servidor.rede.enviar(resposta, src_addr)
-                    self.fila_seg_enviado.append(
-                        (time.time(), resposta, src_addr, len_dados))
+        dest_addr = str2addr(dest_addr)
+        dest_addr, = struct.unpack('!I', dest_addr)
+        result = []
+        #Faz um for na tabela de encaminhamento para armazenar os próximos saltos no vetor result
+        #Fazendo o desempate pegando a entrada com o prefixo mais longo
+        for linha in self.tabela_enc:
+            cidr, next_hop = linha
+            addr, n = cidr.split("/")
 
-                if len(self.fila_seg_enviado):
-                    self.timer = asyncio.get_event_loop().call_later(
-                        self.TimeoutInterval, self._timeout)
-                # else:
-                # self.tam_janela += MSS
+            addr = str2addr(addr)
+            addr, = struct.unpack('!I', addr)
+            destino_addr = dest_addr >> 32 - int(n) << 32 - int(n)
 
-    # Os métodos abaixo fazem parte da API
+            if addr == destino_addr:
+                result.append((int(n), next_hop))
+
+        if len(result):
+            resulOrdenado = sorted(result,
+                                   reverse=True,
+                                   key=lambda tup: tup[0])
+            longer = resulOrdenado[0]
+            resultNextHop = longer[1]
+            #Retorna o próximo salto
+            return resultNextHop
+
+    def definir_endereco_host(self, meu_endereco):
+        """
+        Define qual o endereço IPv4 (string no formato x.y.z.w) deste host.
+        Se recebermos datagramas destinados a outros endereços em vez desse,
+        atuaremos como roteador em vez de atuar como host.
+        """
+        self.meu_endereco = meu_endereco
+
+    def definir_tabela_encaminhamento(self, tabela):
+        """
+        Define a tabela de encaminhamento no formato
+        [(cidr0, next_hop0), (cidr1, next_hop1), ...]
+
+        Onde os CIDR são fornecidos no formato 'x.y.z.w/n', e os
+        next_hop são fornecidos no formato 'x.y.z.w'.
+        """
+        # TODO: Guarde a tabela de encaminhamento. Se julgar conveniente,
+        # converta-a em uma estrutura de dados mais eficiente.
+        self.tabela_enc = tabela  #Definindo tabela de encaminhamento
 
     def registrar_recebedor(self, callback):
         """
-        Usado pela camada de aplicação para registrar uma função para ser chamada
-        sempre que dados forem corretamente recebidos.
+        Registra uma função para ser chamada quando dados vierem da camada de rede
         """
         self.callback = callback
 
-    def enviar(self, dados):
+    def enviar(self, segmento, dest_addr, protocol=0x06):
         """
-        Usado pela camada de aplicação para enviar dados
+        Envia segmento para dest_addr, onde dest_addr é um endereço IPv4
+        (string no formato x.y.z.w).
         """
-        # TODO: implemente aqui o envio de dados.
-        # Chame self.servidor.rede.enviar(segmento, dest_addr) para enviar o segmento
-        # que você construir para a camada de rede.
-        src_addr, src_port, dst_addr, dst_port = self.id_conexao
-        size = ceil(len(dados) / MSS)
-        for i in range(size):
-            self.seq_envia = self.tam_segmento
-            segment = make_header(dst_port,
-                                  src_port,
-                                  self.seq_envia,
-                                  self.seq_esperado,
-                                  flags=FLAGS_ACK)
-            segment += (dados[i * MSS:min((i + 1) * MSS, len(dados))])
-            len_dados = len(dados[i * MSS:min((i + 1) * MSS, len(dados))])
-            self.tam_segmento += len_dados
-            resposta = fix_checksum(segment, dst_addr, src_addr)
-            if (self.tam_seg_enviado + len_dados <= self.tam_janela):
+        next_hop = self._next_hop(dest_addr)
+        # TODO: Assumindo que a camada superior é o protocolo TCP, monte o
+        # datagrama com o cabeçalho IP, contendo como payload o segmento.
 
-                self.servidor.rede.enviar(resposta, src_addr)
-                self.fila_seg_enviado.append(
-                    (time.time(), resposta, src_addr, len_dados))
-                self.tam_seg_enviado += len_dados  # += len(resposta)
-                if (self.timer == None):
-                    self.timer = asyncio.get_event_loop().call_later(
-                        self.TimeoutInterval, self._timeout)
-            else:
-                self.fila_seg_esperando.append((resposta, src_addr, len_dados))
+        byte0 = struct.pack("!B", 0x45)
 
-    def fechar(self):
-        """
-        Usado pela camada de aplicação para fechar a conexão
-        """
-        # TODO: implemente aqui o fechamento de conexão
-        self.seq_envia = self.tam_segmento
+        byte1 = struct.pack("!B", 0x00)
 
-        src_addr, src_port, dst_addr, dst_port = self.id_conexao
-        segment = make_header(dst_port, src_port, self.seq_envia,
-                              self.seq_esperado + 1, FLAGS_FIN)
-        resposta = fix_checksum(segment, dst_addr, src_addr)
-        self.servidor.rede.enviar(resposta, src_addr)
+        tamTotal = 20 + len(segmento)
+        byte2and3 = struct.pack("!H", tamTotal)
+
+        identification = self.contador
+        self.contador += 1
+        byte4and5 = struct.pack("!H", identification)
+
+        byte6and7 = struct.pack("!H", 0x00)
+
+        timeToLive = 64
+        byte8 = struct.pack("!B", timeToLive)
+
+        byte9 = struct.pack("!B", protocol)
+
+        byte10and11 = struct.pack("!H", 0x0000)
+
+        sourceIpAddr, = struct.unpack('!I', str2addr(self.meu_endereco))
+        byte12to15 = struct.pack("!I", sourceIpAddr)
+
+        destIpAddr, = struct.unpack('!I', str2addr(dest_addr))
+        byte16to19 = struct.pack("!I", destIpAddr)
+
+        #Montando o datagrama para enviar
+        datagrama = byte0 + byte1 + byte2and3 + byte4and5 + byte6and7 + byte8 + byte9 + byte10and11 + byte12to15 + byte16to19
+        headerChecksum = calc_checksum(datagrama)
+        byte10and11 = struct.pack("!H", headerChecksum)
+        datagrama = byte0 + byte1 + byte2and3 + byte4and5 + byte6and7 + byte8 + byte9 + byte10and11 + byte12to15 + byte16to19
+        #Enviando o datagrama mais o seguimento para o next_hop
+        self.enlace.enviar(datagrama + segmento, next_hop)
